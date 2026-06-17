@@ -416,3 +416,24 @@ binds {
     Super+Alt+L allow-inhibiting=false { spawn "swaylock"; }
 }
 ```
+
+#### `redetect-outputs`
+
+<sup>Since: next release</sup>
+
+Rescan the connectors of all DRM devices and reconcile niri's outputs with the monitors currently connected, the same way niri does on startup and when resuming from suspend.
+
+Niri normally keeps its outputs up to date automatically by reacting to hotplug events from the kernel.
+This action is a manual recovery for the rare case where niri missed such an event and its outputs no longer match the physically connected monitors—for example, after (un)plugging a dock, or resuming from suspend with a different set of monitors.
+
+```kdl
+binds {
+    Mod+Shift+D { redetect-outputs; }
+}
+```
+
+You can also trigger it without a binding:
+
+```shell
+niri msg action redetect-outputs
+```

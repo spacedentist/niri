@@ -682,6 +682,9 @@ impl State {
             Action::PowerOnMonitors => {
                 self.niri.activate_monitors(&mut self.backend);
             }
+            Action::RedetectOutputs => {
+                self.backend.redetect_outputs(&mut self.niri);
+            }
             Action::ToggleDebugTint => {
                 self.backend.toggle_debug_tint();
                 self.niri.queue_redraw_all();
@@ -4594,6 +4597,7 @@ fn allowed_when_locked(action: &Action) -> bool {
             | Action::Suspend
             | Action::PowerOffMonitors
             | Action::PowerOnMonitors
+            | Action::RedetectOutputs
             | Action::SwitchLayout(_)
             | Action::ToggleKeyboardShortcutsInhibit
     )

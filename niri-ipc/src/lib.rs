@@ -202,6 +202,13 @@ pub enum Action {
     PowerOffMonitors {},
     /// Power on all monitors via DPMS.
     PowerOnMonitors {},
+    /// Re-detect connected outputs.
+    ///
+    /// Rescans the connectors of all DRM devices and reconciles niri's outputs with the
+    /// connectors currently reported by the kernel. This is useful as a manual recovery when
+    /// niri missed a hotplug event and its set of outputs no longer matches the physically
+    /// connected monitors (for example after (un)plugging a dock or resuming from suspend).
+    RedetectOutputs {},
     /// Spawn a command.
     Spawn {
         /// Command to spawn.

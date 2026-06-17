@@ -2551,6 +2551,178 @@ impl Tty {
         self.refresh_ipc_outputs(niri);
     }
 
+    /// Re-detects connected outputs, recovering from missed or mishandled hotplug events.
+    ///
+    /// Niri normally keeps its outputs in sync with connected monitors by reacting to udev hotplug
+    /// events. Occasionally an event is missed or only partially processed — most often when
+    /// (un)plugging a dock or resuming from suspend — and niri's outputs drift out of sync with the
+    /// monitors the kernel reports.
+    ///
+    /// The recovery works by recreating each DRM device's `DrmScanner` and reconciling its surfaces
+    /// against the connectors the kernel currently reports. Recreating the scanner is the crucial
+    /// part: smithay's `SimpleCrtcMapper` only releases a connector's CRTC reservation when it later
+    /// sees that connector reported as *disconnected*. But DP-MST connectors (USB-C docks) instead
+    /// vanish entirely across suspend/redock — their handles disappear from the kernel and reappear
+    /// under new handles — so the old reservations are never released and accumulate. Once every
+    /// CRTC is reserved by a ghost handle, a freshly connected monitor can no longer be assigned a
+    /// CRTC and silently never becomes an output. A plain rescan cannot release those reservations;
+    /// only discarding the scanner state can.
+    ///
+    /// Working outputs and the renderer are left untouched, so this only lights up monitors that
+    /// were missing and tears down ones that lingered.
+    pub fn redetect_outputs(&mut self, niri: &mut Niri) {
+        let _span = tracy_client::span!("Tty::redetect_outputs");
+        debug!("re-detecting outputs");
+
+        if !self.session.is_active() {
+            debug!("not re-detecting outputs because session is inactive");
+            return;
+        }
+
+        // Re-resolve /dev/dri/by-path/... symlinks in case ignored nodes changed.
+        self.ignored_nodes = self.compute_ignored_nodes();
+
+        // Snapshot the current udev device list.
+        let mut device_list = self
+            .udev_dispatcher
+            .as_source_ref()
+            .device_list()
+            .map(|(device_id, path)| (device_id, path.to_owned()))
+            .collect::<HashMap<_, _>>();
+
+        // Remove devices that disappeared or became ignored.
+        let removed_devices = self
+            .devices
+            .keys()
+            .filter(|node| {
+                !device_list.contains_key(&node.dev_id()) || self.ignored_nodes.contains(node)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for node in removed_devices {
+            device_list.remove(&node.dev_id());
+            self.device_removed(node.dev_id(), niri);
+        }
+
+        // Reset the scanner of each known device and reconcile its surfaces.
+        let remained_devices = self
+            .devices
+            .keys()
+            .filter(|node| {
+                device_list.contains_key(&node.dev_id()) && !self.ignored_nodes.contains(node)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for node in &remained_devices {
+            device_list.remove(&node.dev_id());
+            self.reset_scanner_and_reconcile(niri, *node);
+        }
+
+        // Add devices we didn't know about yet (in case an Added event was missed too).
+        //
+        // Add the primary node first as later nodes might depend on the primary render node being
+        // available.
+        let primary_device_id = self.primary_node.dev_id();
+        let primary = device_list
+            .remove(&primary_device_id)
+            .map(|path| (primary_device_id, path));
+        for (device_id, path) in primary.into_iter().chain(device_list) {
+            if let Err(err) = self.device_added(device_id, &path, niri) {
+                warn!("error adding device: {err:?}");
+            }
+        }
+
+        // Connect any connectors that became mappable on the devices we reset above. (device_added
+        // already connected the freshly added devices via its own reconciliation.)
+        if !remained_devices.is_empty() {
+            self.on_output_config_changed(niri);
+        }
+    }
+
+    /// Recreates a device's `DrmScanner` and reconciles its surfaces with the connectors the kernel
+    /// currently reports. See [`Tty::redetect_outputs`] for why the scanner is recreated.
+    ///
+    /// Tears down surfaces whose CRTC is no longer backed by a connected connector and rebuilds
+    /// `known_crtcs` from the fresh scan; the caller is responsible for connecting newly mappable
+    /// connectors via [`Tty::on_output_config_changed`].
+    fn reset_scanner_and_reconcile(&mut self, niri: &mut Niri, node: DrmNode) {
+        let (rebuilt, stale) = {
+            let Some(device) = self.devices.get_mut(&node) else {
+                return;
+            };
+
+            device.drm_scanner = DrmScanner::new();
+            if let Err(err) = device.drm_scanner.scan_connectors(&device.drm) {
+                warn!("error scanning connectors during redetect: {err:?}");
+                return;
+            }
+
+            // Connectors currently connected and assigned a CRTC by the fresh mapper.
+            let live: Vec<(crtc::Handle, connector::Info)> = device
+                .drm_scanner
+                .crtcs()
+                .filter(|(info, _)| info.state() == connector::State::Connected)
+                .map(|(info, crtc)| (crtc, info.clone()))
+                .collect();
+
+            // Re-derive names (including make/model/serial from EDID) for the live connectors.
+            let mut rebuilt: Vec<(crtc::Handle, OutputName)> = Vec::with_capacity(live.len());
+            for (crtc, info) in &live {
+                let connector_name = format_connector_name(info);
+                let name = make_output_name(&device.drm, info.handle(), connector_name);
+                rebuilt.push((*crtc, name));
+            }
+
+            // Surfaces whose CRTC is no longer backed by a live connector (leftover or duplicate
+            // outputs from earlier missed events).
+            let stale: Vec<crtc::Handle> = device
+                .surfaces
+                .keys()
+                .copied()
+                .filter(|crtc| !live.iter().any(|(c, _)| c == crtc))
+                .collect();
+
+            (rebuilt, stale)
+        };
+
+        for crtc in stale {
+            self.connector_disconnected(niri, node, crtc);
+        }
+
+        // Rebuild known_crtcs from the fresh scan. OutputIds are re-minted; they are only IPC map
+        // keys and downstream consumers key by connector name, so the churn is harmless.
+        self.devices.get_mut(&node).unwrap().known_crtcs.clear();
+        for (crtc, mut name) in rebuilt {
+            // Make/model/serial can match between distinct identical monitors, which our Layout
+            // can't represent; unname duplicates, keeping the always-unique connector name.
+            let formatted = name.format_make_model_serial_or_connector();
+            let is_duplicate = self
+                .devices
+                .values()
+                .flat_map(|d| d.known_crtcs.values())
+                .any(|info| info.name.matches(&formatted));
+            if is_duplicate {
+                let connector = mem::take(&mut name.connector);
+                warn!(
+                    "connector {connector} duplicates make/model/serial of an existing \
+                     connector, unnaming"
+                );
+                name = OutputName {
+                    connector,
+                    make: None,
+                    model: None,
+                    serial: None,
+                };
+            }
+
+            self.devices
+                .get_mut(&node)
+                .unwrap()
+                .known_crtcs
+                .insert(crtc, CrtcInfo { id: OutputId::next(), name });
+        }
+    }
+
     pub fn get_device_from_node(&mut self, node: DrmNode) -> Option<&mut OutputDevice> {
         self.devices.get_mut(&node)
     }

@@ -201,6 +201,14 @@ impl Backend {
         }
     }
 
+    pub fn redetect_outputs(&mut self, niri: &mut Niri) {
+        match self {
+            Backend::Tty(tty) => tty.redetect_outputs(niri),
+            Backend::Winit(_) => (),
+            Backend::Headless(_) => (),
+        }
+    }
+
     pub fn tty_checked(&mut self) -> Option<&mut Tty> {
         if let Self::Tty(v) = self {
             Some(v)
